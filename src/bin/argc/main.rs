@@ -432,13 +432,91 @@ fn parse_script_args(args: &[String]) -> Result<(String, String, Vec<String>)> {
     let script_file = args[0].as_str();
     let script_file = normalize_script_path(script_file);
     let args: Vec<String> = args[1..].to_vec();
-    let source = fs::read_to_string(&script_file)
+    let source_raw = fs::read_to_string(&script_file)
         .with_context(|| format!("Failed to load script at '{script_file}'"))?;
+    let base_dir = Path::new(&script_file)
+        .parent()
+        .map(|p| p.to_path_buf())
+        .unwrap_or_else(|| PathBuf::from("."));
+    let source = expand_includes(&source_raw, &base_dir)?;
     let name = get_script_name(&script_file)?;
     let name = name.strip_suffix(".sh").unwrap_or(name);
     let mut cmd_args = vec![name.to_string()];
     cmd_args.extend(args);
     Ok((source, script_file, cmd_args))
+}
+
+fn expand_includes(source: &str, base_dir: &Path) -> Result<String> {
+    use std::collections::HashSet;
+    fn expand_recursive(
+        src: &str,
+        dir: &Path,
+        seen: &mut HashSet<PathBuf>,
+    ) -> Result<String> {
+        let mut out = String::with_capacity(src.len());
+        for line in src.lines() {
+            let trimmed = line.trim_start();
+            // Support both "# @include ..." and "@include ..."
+            let inc_str = if let Some(rest) = trimmed.strip_prefix("# @include ") {
+                Some(rest)
+            } else if let Some(rest) = trimmed.strip_prefix("@include ") {
+                Some(rest)
+            } else {
+                None
+            };
+            if let Some(rest) = inc_str {
+                // Extract path token; allow quoted or unquoted
+                let rest = rest.trim();
+                let (path_str, _) = if rest.starts_with('"') || rest.starts_with('\'') {
+                    // Quoted string
+                    let quote = rest.chars().next().unwrap();
+                    let mut end = 1usize;
+                    while end < rest.len() {
+                        let c = rest.chars().nth(end).unwrap();
+                        if c == quote { break; }
+                        end += 1;
+                    }
+                    if end >= rest.len() {
+                        (&rest[1..], "")
+                    } else {
+                        (&rest[1..end], &rest[end+1..])
+                    }
+                } else {
+                    // Up to whitespace
+                    match rest.split_once(char::is_whitespace) {
+                        Some((p, r)) => (p, r),
+                        None => (rest, ""),
+                    }
+                };
+                let inc_path = Path::new(path_str);
+                let resolved = if inc_path.is_absolute() {
+                    inc_path.to_path_buf()
+                } else {
+                    dir.join(inc_path)
+                };
+                let resolved = resolved
+                    .canonicalize()
+                    .with_context(|| format!("Failed to resolve include '{}'", resolved.display()))?;
+                if seen.contains(&resolved) {
+                    bail!("Cyclic @include detected for '{}'", resolved.display());
+                }
+                let content = fs::read_to_string(&resolved)
+                    .with_context(|| format!("Failed to load include '{}'", resolved.display()))?;
+                seen.insert(resolved.clone());
+                let inc_dir = resolved.parent().map(|p| p.to_path_buf()).unwrap_or(dir.to_path_buf());
+                let expanded = expand_recursive(&content, &inc_dir, seen)?;
+                out.push_str(&expanded);
+                out.push('\n');
+            } else {
+                out.push_str(line);
+                out.push('\n');
+            }
+        }
+        Ok(out)
+    }
+
+    let mut seen = std::collections::HashSet::new();
+    expand_recursive(source, base_dir, &mut seen)
 }
 
 fn get_script_name(script_path: &str) -> Result<&str> {
