@@ -187,7 +187,7 @@ fn run() -> Result<i32> {
         Ok(0)
     } else {
         let shell = runtime.shell_path()?;
-        let (script_dir, script_file) = get_script_path(true)
+        let (script_dir, script_file_path) = get_script_path(true)
             .ok_or_else(|| anyhow!("Argcfile not found, try `argc --argc-help` for help."))?;
         let mut envs = HashMap::new();
         if let Some(cwd) = runtime.current_dir() {
@@ -195,9 +195,16 @@ fn run() -> Result<i32> {
                 envs.insert("ARGC_PWD".to_string(), cwd);
             }
         }
-        let script_file = script_file.display().to_string();
-        let args = [vec![&script_file], args[1..].iter().collect()].concat();
-        run_command(&script_file, &shell, &args, envs, Some(&script_dir))
+        // Expand includes and run a temporary combined script to ensure runtime sees included functions
+        let script_file = script_file_path.display().to_string();
+        let (expanded_source, _orig_path, _cmd_args_dummy) = parse_script_args(&vec![script_file.clone()])?;
+        let temp_script = write_temp_combined_script(&script_dir, &expanded_source)?;
+        let temp_script_str = temp_script.display().to_string();
+        let args = [vec![&temp_script_str], args[1..].iter().collect()].concat();
+        let code = run_command(&temp_script_str, &shell, &args, envs, Some(&script_dir))?;
+        // Clean up temporary combined script
+        let _ = fs::remove_file(&temp_script);
+        Ok(code)
     }
 }
 
@@ -517,6 +524,22 @@ fn expand_includes(source: &str, base_dir: &Path) -> Result<String> {
 
     let mut seen = std::collections::HashSet::new();
     expand_recursive(source, base_dir, &mut seen)
+}
+
+fn write_temp_combined_script(dir: &Path, content: &str) -> Result<PathBuf> {
+    use std::time::{SystemTime, UNIX_EPOCH};
+    let ts = SystemTime::now().duration_since(UNIX_EPOCH)?.as_millis();
+    let mut path = dir.to_path_buf();
+    path.push(format!(".argc-combined-{ts}.sh"));
+    fs::write(&path, content)?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let mut perm = fs::metadata(&path)?.permissions();
+        perm.set_mode(0o755);
+        fs::set_permissions(&path, perm)?;
+    }
+    Ok(path)
 }
 
 fn get_script_name(script_path: &str) -> Result<&str> {
